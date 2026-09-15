@@ -1,64 +1,118 @@
-// Package upstream 封装对 CodeBuddy 上游（chat / billing / auth）的全部 HTTP 调用，
-// 以及错误分类（驱动 pool 冷却状态机）。
+// Package upstream 直连 WorkBuddy 上游（CN: copilot.tencent.com / codebuddy.cn，
+// GLOBAL: workbuddy.ai）的客户端，用于 GUI 侧的 OAuth 登录、token 刷新、签到、
+// 余额查询与猫猫旅行。
+//
+// 请求头/路径/信封格式与 workbuddy2api/internal/upstream 保持一致，保证同一账号
+// 在网关与 GUI 两侧看到的指纹相同、行为可预期。
 package upstream
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
+	neturl "net/url"
 	"regexp"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"workbuddy2api/internal/auth"
-	"workbuddy2api/internal/logfmt"
+	"workbuddy-control-center/internal/authstore"
 )
 
-// ErrKind 错误分类，pool 据此决定冷却时长。
+// Region 上游区域。
+type Region string
+
+const (
+	// RegionCN 国内版（copilot.tencent.com / codebuddy.cn）。
+	RegionCN Region = "cn"
+	// RegionGlobal 国际版（workbuddy.ai）。
+	RegionGlobal Region = "global"
+)
+
+// NormalizeRegion 规范化 region 字符串（大小写/空白容错）；非法值返回错误。
+func NormalizeRegion(s string) (Region, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "cn":
+		return RegionCN, nil
+	case "global":
+		return RegionGlobal, nil
+	default:
+		return "", fmt.Errorf("未知区域 %q（可选 cn | global）", s)
+	}
+}
+
+// 上游常量。
+const (
+	ChatBaseCN        = "https://copilot.tencent.com"
+	BillingBaseCN     = "https://www.codebuddy.cn"
+	ChatBaseGlobal    = "https://www.workbuddy.ai"
+	BillingBaseGlobal = "https://www.workbuddy.ai"
+
+	clientUA     = "CLI/2.63.2 CodeBuddy/2.63.2"
+	originCN     = "https://www.codebuddy.cn"
+	originGlobal = "https://www.workbuddy.ai"
+
+	// EndpointAuthState 设备授权：申请 state + authUrl。
+	EndpointAuthState = "/v2/plugin/auth/state?platform=CLI"
+	// EndpointAuthToken 轮询登录结果（state 由服务端签发，无 PKCE）。
+	EndpointAuthToken = "/v2/plugin/auth/token?state="
+	// EndpointLoginAccount 拿 uid / nickname / enterpriseId。
+	EndpointLoginAccount = "/v2/plugin/login/account?state="
+
+	// growth 域「猫猫旅行」路径。
+	TravelStatusPath   = "/activity/growth/buddy/travel/status"
+	TravelDepartPath   = "/activity/growth/buddy/travel/depart"
+	TravelClaimPath    = "/activity/growth/buddy/travel/claim"
+	BuddyInfoPath      = "/activity/growth/buddy/info"
+	BuddyFirstPath     = "/activity/growth/buddy/first"
+	BuddyAgreementPath = "/activity/growth/buddy/agreement"
+
+	// TravelLocationID 派出地点固定 4（古镇客栈）：4 个地点收益/时长区间完全相同，无最优解。
+	TravelLocationID = 4
+)
+
+// buddyTaskIncompleteMarker 领养门槛未达标的业务错误关键词。
+const buddyTaskIncompleteMarker = "first_buddy task not completed yet"
+
+// ErrKind 错误分类，用于给前端区分「账号失效」「限流」「余额不足」等处置建议。
 type ErrKind int
 
 const (
-	ErrNone           ErrKind = iota // 成功
-	ErrHardCredit                    // 余额不足（402 或 body 关键词）→ 长冷却
-	ErrSoftRate                      // 429 软限流 → 短冷却
-	ErrSessionDead                   // 401 + 12153 offline session 失效 → 禁用
-	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
-	ErrServer                        // 5xx 上游故障
-	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
-	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
-	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
-	ErrClient                        // 其他 4xx / 业务错误
+	// ErrNone 未分类。
+	ErrNone ErrKind = iota
+	// ErrHardCredit 余额/额度耗尽（HTTP 402 或余额关键词）。
+	ErrHardCredit
+	// ErrSoftRate 限流（HTTP 429 或限流文案）。
+	ErrSoftRate
+	// ErrSessionDead 会话失效，需人工重新登录。
+	ErrSessionDead
+	// ErrNotFound 上游路径 404。
+	ErrNotFound
+	// ErrServer 上游 5xx。
+	ErrServer
+	// ErrClient 其余 4xx / 业务 code != 0。
+	ErrClient
 )
 
 func (k ErrKind) String() string {
 	switch k {
 	case ErrHardCredit:
-		return "hard_credit"
+		return "余额不足"
 	case ErrSoftRate:
-		return "soft_rate"
+		return "被限流"
 	case ErrSessionDead:
-		return "session_dead"
+		return "会话失效（需重新登录）"
 	case ErrNotFound:
-		return "not_found"
+		return "上游路径不存在"
 	case ErrServer:
-		return "server"
-	case ErrContentBlocked:
-		return "content_blocked"
-	case ErrBadParams:
-		return "bad_params"
-	case ErrAccountFault:
-		return "account_fault"
+		return "上游服务端错误"
 	case ErrClient:
-		return "client"
-	default:
-		return "none"
+		return "客户端/业务错误"
 	}
+	return "未知"
 }
 
 // Error 带分类的上游错误。
@@ -69,244 +123,119 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
-	return fmt.Sprintf("upstream %s (http %d): %s", e.Kind, e.Status, e.Msg)
+	if e.Status > 0 {
+		return fmt.Sprintf("%s (HTTP %d): %s", e.Kind, e.Status, e.Msg)
+	}
+	return fmt.Sprintf("%s: %s", e.Kind, e.Msg)
 }
 
-// hardMarkers 余额不足关键词（小写比较 + 中文原文比较双通道）。
+// hardMarkers 余额不足关键词（小写匹配）。
 var hardMarkers = []string{
-	"insufficient credit", "no credit", "credit exhausted", "out of credit",
-	"quota exceeded", "quota exhaust", "payment required", "credit not enough",
-	"not enough credit",
-	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
+	"insufficient", "quota exceeded", "no enough", "not enough credit",
+	"balance", "余额不足", "积分不足", "额度不足", "欠费",
 }
 
-// softRateMarkers 限流/节流关键词（小写比较 + 中文原文比较双通道）。
-// 上游在状态码非 429 时也会返回限流语义（如 200 + code 11140
-// "The model provider is rate-limiting requests."、400 + "rate limit"），
-// 此类响应若不识别，账号既不被冷却也不喂熔断，下次请求仍会被选中（issue #28）。
-//
-// 词表按子串匹配，宁缺毋滥：只收录明确指向「请求速率/模型用量被节流」的措辞。
-// 连字符形式（rate-limiting / rate-limited）需单列——Contains 不跨 '-'。
-// "too many" 会命中 "too many tokens" 这类客户端参数错误，代价是该号被软冷却
-// 一个 SoftCooldown（默认 60s）后自愈，远小于漏判限流导致反复选中同一号的代价。
+// softRateMarkers 限流关键词（小写匹配）。
 var softRateMarkers = []string{
-	"rate limit", // rate limit / rate limits / rate limiting
-	"rate-limiting",
-	"rate-limited",
-	"too many requests",
-	"too many",
-	"usage limit", // usage limit reached / model usage limit exceeded（用量节流，非计费余额）
-	"请求过于频繁", "限流",
+	"rate limit", "rate-limit", "rate_limit", "too many requests", "too many request",
+	"请求过于频繁", "限流", "频率", "slow down", "throttl",
 }
 
-var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
-
-// contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
-//
-// 定位：上游按逐字精确指纹审核，system 来源的模板句（如 Claude Code/Codex
-// 注入指令）触发 HTTP 400 + 以下文案。这是「误报」（合法流量被审核误杀），
-// 非账号问题——该账号余额健康、未限流、session 未死，故 ErrContentBlocked
-// 在 applyErrorPolicy 中不罚账号（无冷却/熔断/NoteError），改由网关降级重试。
-var contentBlockedMarkers = []string{
-	"blocked by security policy",
-	"unapproved channel",
-	"illegal api invocation",
+// sessionDeadMarkers 会话失效关键词。
+var sessionDeadMarkers = []string{
+	"offline user session not found", "12153", "session not found", "session expired", "登录已失效",
 }
 
-// contentBlockedClientMsg 内容拦截返回给调用方的固定文案。
-// [关键词] 填分类词（色情 / nsfw / 暴力 等），绝不填业务 code、账号、冷却、upstream 前缀。
-const contentBlockedClientMsg = "触发网站风控违禁词，无法调用模型：内容命中网关内容防火墙规则[%s]，已被拦截。请修改内容后重试。"
-
-const contentBlockedFallbackKeyword = "违禁词"
-
-// contentBlockedKeywords 审核分类词，按优先级扫描上游文案（大小写不敏感）。
-// 只收录可直接展示给调用方的分类标签，不收录错误码（如 11128）。
-var contentBlockedKeywords = []string{
-	"色情", "porn", "nsfw", "adult",
-	"暴力", "violence",
-	"政治", "politics",
-	"赌博", "gambling",
-	"毒品", "drug",
-	"违禁词",
-}
-
-// ContentBlockedClientMessage 把上游内容拦截改写成网关防火墙口径，不含账号/错误码。
-func ContentBlockedClientMessage(body string) string {
-	return fmt.Sprintf(contentBlockedClientMsg, contentBlockedKeyword(body))
-}
-
-// contentBlockedKeyword 从审核文案抽出分类关键词；抽不到则回「违禁词」。
-func contentBlockedKeyword(body string) string {
-	text := body
-	var env struct {
-		Msg string `json:"msg"`
-	}
-	if json.Unmarshal([]byte(body), &env) == nil && strings.TrimSpace(env.Msg) != "" {
-		text = env.Msg
-	}
-	lower := strings.ToLower(text)
-	for _, kw := range contentBlockedKeywords {
-		if strings.Contains(lower, strings.ToLower(kw)) {
-			return kw
-		}
-	}
-	return contentBlockedFallbackKeyword
-}
-
-// badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
-// "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
-// 与账号健康无关——不罚号，但仍轮转（commit B）。
-var badParamsMarkerMsg = "Unmarshal chat params failed"
-var badParamsMarkerCode = `"code":11101`
-
-// alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
-// 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
-// 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
-var alreadyCheckinMarkers = []string{"已签到", "already"}
-
-// accountFaultMarkers 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
-//
-// 定位：这类错误是**账号本身状态**决定的本机故障，不是请求格式、不是临时限流、
-// 也不是内容误报——继续重试只会反复刷上游风控/配额检查，必须把该账号冷却轮换。
-//   - "request illegal"（code 11140）→ 上游 auth/auth_forbidden，账号级授权风控
-//     （实测 global 账号：同一规范化请求 A1 403/11140 vs A2 429/14017，差异全由账号
-//     数据决定）。需重新 OAuth 登录才能恢复，短冷却只能阻止继续送死。
-//   - code 14017（"trial not activated" / "The trial version is not yet activated"）→
-//     上游 quota/quota_not_activated，register 未完成的试用未激活账号，同样账号级。
-//
-// 注意 11140 **不能**按 code 判定：该 code 也承载模型级限流文案（"The model provider
-// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（上方 softRateMarkers
-// 先命中）。故此处只收 msg 关键词 "request illegal"（auth_forbidden 的真实文案），
-// 120 与 private 均落同一分类。14017 文案唯一（无软限流歧义），可安全收录。
-var accountFaultMarkers = []string{
-	"request illegal",
-	"trial not activated",
-	"trial version is not yet activated",
-}
-
-// softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
-// 与容器时区无关）。
-var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
-
-// SoftRateResetLoc 暴露重置时间的固定时区（供测试构造/断言同一时区口径）。
-func SoftRateResetLoc() *time.Location { return softRateResetLoc }
-
-// modelRateLimitCode 明确指向「模型级 429 限流」的业务 code。
-// 上游用它表达"该模型的使用量超限"（code 6004，msg 带「将在 … 重置」），
-// 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
-const modelRateLimitCode = "6004"
-
-// softRateResetRe 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetRe = `将在 (.+?) 重置`
-
-// softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
-const softRateTimeLayout = "2006-01-02 15:04:05"
-
-// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）。
-// 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
-func IsModelRateLimit(body string) bool {
-	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
-	re := regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
-	return re.MatchString(body)
-}
-
-// ParseSoftRateReset 从 429 body 解析「将在 … 重置」时间（上游 UTC+8 文案）。
-// 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
-// 内部先判 IsModelRateLimit：非模型级限流（非 6004）即使带"重置"字样也不返回——该重置
-// 无冷却语义（如 11140 的通用限流提示），解析出来反而会错误收窄冷却。
-func ParseSoftRateReset(body string) (time.Time, bool) {
-	if !IsModelRateLimit(body) {
-		return time.Time{}, false
-	}
-	re := regexp.MustCompile(softRateResetRe)
-	m := re.FindStringSubmatch(body)
-	if len(m) < 2 {
-		return time.Time{}, false
-	}
-	ts := strings.TrimSpace(m[1])
-	ts = strings.TrimSuffix(ts, " UTC+8") // 去掉后缀，固定按 softRateResetLoc 解释
-	t, err := time.ParseInLocation(softRateTimeLayout, ts, softRateResetLoc)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
-}
-
-// Classify 按 HTTP 状态码 + body 判定错误类别。
-//
-// 判定顺序自「严」到「宽」，每层的先后都有语义依据：
-//  1. 402 / hardMarkers —— 计费额度耗尽，最严、最不可自愈，必须最先判。
-//     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit，本次保持不变
-//     （issue #28 已记录该反向误判风险，待上游原始响应确认后再定）。
-//  2. sessionDeadMarkers —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
-//     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
-//     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
-//     比限流层的大范围子串更具体，具体优先于宽泛。
-//  3. accountFaultMarkers —— 账号级授权/配额故障（11140 request illegal auth 风控、
-//     14017 trial not activated register 未完成）。与 429 一起纳入轮换冷却，且必须
-//     先于 softRate/status429 判定：14017 常带 429 状态码，若落到 status==429 兜底
-//     会误归 soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。
-//     11140 的 model 级限流变体（rate-limiting 文案）因 marker 不含该文案而天然
-//     落到 softRateMarkers 层，不受影响。
-//  4. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
-//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时在此短路，
-//     结果同为 soft_rate，与下一层一致。
-//  5. status==429 —— body 无文案时的兜底识别。
-//  6. 404 / 5xx / 其他 4xx —— 与限流无关的常规分类。
+// Classify 按 HTTP 状态码 + body 判定错误类别（判定顺序自严到宽）。
 func Classify(status int, body string) ErrKind {
-	if status == http.StatusPaymentRequired {
-		return ErrHardCredit
-	}
 	lower := strings.ToLower(body)
-	for _, m := range hardMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrHardCredit
-		}
-	}
-	for _, m := range sessionDeadMarkers {
-		if strings.Contains(body, m) {
-			return ErrSessionDead
-		}
-	}
-	for _, m := range accountFaultMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrAccountFault
-		}
-	}
-	for _, m := range softRateMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrSoftRate
-		}
-	}
-	if status == http.StatusTooManyRequests {
-		return ErrSoftRate
-	}
-	if status == http.StatusNotFound {
-		return ErrNotFound
-	}
-	if status >= 500 {
-		return ErrServer
-	}
-	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
-	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
-	if status >= 400 {
-		for _, m := range contentBlockedMarkers {
+	has := func(markers []string) bool {
+		for _, m := range markers {
 			if strings.Contains(lower, m) {
-				return ErrContentBlocked
+				return true
 			}
 		}
-		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
-		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
-		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
-		// 归 ErrBadParams：不冷却/不熔断/不计错，但**仍然轮转**（不同账号可能有不同的
-		// 模型权限，值得再试一次）。
-		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
-			return ErrBadParams
-		}
+		return false
+	}
+	// 1. 计费耗尽最严，最先判。
+	if status == http.StatusPaymentRequired || has(hardMarkers) {
+		return ErrHardCredit
+	}
+	// 2. 会话失效：需要人工重登的终态，比限流更具体。
+	if has(sessionDeadMarkers) {
+		return ErrSessionDead
+	}
+	// 3. 非 429 状态码携带限流文案。
+	if has(softRateMarkers) {
+		return ErrSoftRate
+	}
+	switch {
+	case status == http.StatusTooManyRequests:
+		return ErrSoftRate
+	case status == http.StatusUnauthorized:
+		// 鉴权层直接拒绝（token 失效/过期）：需要刷新或重新登录，按会话失效归类最可操作。
+		return ErrSessionDead
+	case status == http.StatusNotFound:
+		return ErrNotFound
+	case status >= 500:
+		return ErrServer
+	case status >= 400:
 		return ErrClient
 	}
-	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
 	return ErrNone
+}
+
+// IsSessionDead 报告错误是否为「会话失效」。
+func IsSessionDead(err error) bool {
+	var ue *Error
+	return errors.As(err, &ue) && ue.Kind == ErrSessionDead
+}
+
+// IsAlreadyCheckedIn 判定签到接口返回的是「今日已签到」这类幂等成功。
+func IsAlreadyCheckedIn(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, m := range []string{"已签到", "already", "checkin", "code=10001", "签到过"} {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsBuddyTaskIncomplete 判定领养门槛未达标（HTTP 400 + first_buddy 关键词）。
+func IsBuddyTaskIncomplete(err error) bool {
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Status != http.StatusBadRequest {
+		return false
+	}
+	return strings.Contains(strings.ToLower(ue.Msg), buddyTaskIncompleteMarker)
+}
+
+// Client 上游 HTTP 客户端。
+type Client struct {
+	HTTP    *http.Client
+	Timeout time.Duration
+}
+
+// New 构建客户端；timeout <=0 时用 120s。
+func New(timeout time.Duration) *Client {
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	return &Client{
+		HTTP: &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        50,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
+		Timeout: timeout,
+	}
 }
 
 // apiEnvelope 上游统一信封。
@@ -316,248 +245,262 @@ type apiEnvelope struct {
 	Data json.RawMessage `json:"data"`
 }
 
-// Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
-type Client struct {
-	HTTP *http.Client
-
-	// ChatHTTP 聊天 SSE 专用 client：无总时长上限（Timeout=0），首字节由
-	// Transport.ResponseHeaderTimeout 约束，流中空闲由 IdleTimeout 约束。
-	// 与 HTTP 共享同一个 *http.Transport 实例，连接池不重复。
-	ChatHTTP *http.Client
-
-	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（回落 HTTP.Timeout）。
-	HeaderTimeout time.Duration
-	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
-	IdleTimeout time.Duration
-
-	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
-	// 键按 realm 分层（map[realm]map[model][]efforts）：CN 探测结果不得被 global 同模型名
-	// 请求复用（同名不同档位会错误降级，C-2）。global 侧暂无 efforts 探测 → 桶缺失即透传。
-	effortsMu sync.RWMutex
-	efforts   map[string]map[string][]string
-
-	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
-	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
-	globalModels fetchGlobalModelsCache
-
-	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
-	SanitizeFingerprints bool
-
-	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认 WorkBuddy
-	// 三段式与 billingUA 单段式）。空 = 默认官方形态：chat/refresh/FetchModels 走
-	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing/checkin 走 `WorkBuddy/<ver>`
-	// （仅当 client_name 非空，见 billingUA）。
-	// issue #42 深挖：官网「使用端」列基于出站请求的 UA/X-Product 服务端归因，
-	// 官方 WorkBuddy 桌面 UA 见 defaultWorkBuddyUA。默认值已对齐官方（A 段变更），
-	// 用户仍可显式配置完全自定义的 UA。
-	UserAgent string
-
-	// DeviceToken 设备风控 Token（X-Device-Token 头）兜底来源：config upstream.device_token。
-	// 仅当 auth.Auth.DeviceToken 为空时才取此值；两者皆空则不注入该头。
-	// 容器内无桌面端 Turing SDK，这是把外部（宿主/桌面端）生成的 token 注入的入口。
-	// 另见 DeviceTokenFile 缓存读取：宿主可把 token 落 /app/data/device_token 共用。
-	DeviceToken string
-
-	// DeviceTokenFile 宿主落盘的 device token 文件路径（可选，空 = 不读文件）。
-	// 读取频率限 5 分钟一次缓存（见 device_token.go），>1KB 或读失败则忽略。
-	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
-	DeviceTokenFile string
-
-	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
-	// 空 = 旧行为：X-Product="SaaS"，不设 X-IDE-*（向后兼容，不突变归因）。
-	// 非空（如 "WorkBuddy"）则四头跟随，对齐官方桌面端 client 识别。
-	ClientName string
-
-	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + B 段的
-	// X-IDE-Version）。空 = 内置默认 defaultClientVersion（对齐官方 5.5.4 分发包）。
-	// config upstream.client_version 覆盖。
-	ClientVersion string
-
-	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认 defaultCliVersion
-	// （对齐官方内置 CLI 2.137.1）。config upstream.cli_version 覆盖。
-	CliVersion string
-
-	// PassthroughIP 是否透传客户端 IP 给上游（X-Forwarded-For/X-Real-IP 首段）。
-	// 缺省 false（反代安全边界）；handler 在 chat 路径按请求把 clientIP 参数传入 ChatStream，
-	// 由 ChatHeaders 注入（不再挂共享字段，杜绝并发串扰）。
-	PassthroughIP bool
-
-	ChatBaseCN    string
-	BillingBaseCN string
-
-	// ChatBaseGlobal / BillingBaseGlobal 国际版（global realm）上游 base。
-	// 空 = 缺省默认 https://www.workbuddy.ai（D5）。
-	ChatBaseGlobal    string
-	BillingBaseGlobal string
-
-	// GlobalEnabled 是否启用 global realm 路由（config global.enabled，缺省 true）。
-	// false 即显式逃生门：即使用户 auth 写了 realm=global 也**不**路由到 global base——
-	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
-	GlobalEnabled bool
+// regionBases 返回 region 对应的 chat 基址、billing 基址与 Origin/Referer。
+func regionBases(region Region) (chatBase, billingBase, origin string) {
+	if region == RegionGlobal {
+		return ChatBaseGlobal, BillingBaseGlobal, originGlobal
+	}
+	return ChatBaseCN, BillingBaseCN, originCN
 }
 
-// New 生产默认值。配置连接池减少 TLS 握手。
-func New() *Client {
-	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
-		ResponseHeaderTimeout: 120 * time.Second,
+// regionOfAccount 从账号 domain 反推 region；空/未知 domain 按 CN 处理。
+func regionOfAccount(a *authstore.Account) Region {
+	if a == nil {
+		return RegionCN
 	}
-	return &Client{
-		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		SanitizeFingerprints: true,
-		ChatBaseCN:           "https://copilot.tencent.com",
-		BillingBaseCN:        "https://www.codebuddy.cn",
+	d := strings.ToLower(strings.TrimSpace(a.Domain))
+	d = strings.TrimPrefix(strings.TrimPrefix(d, "https://"), "http://")
+	if d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai") {
+		return RegionGlobal
+	}
+	return RegionCN
+}
+
+// chatBase 返回账号所属 region 的聊天基址。
+func (c *Client) chatBase(a *authstore.Account) string {
+	base, _, _ := regionBases(regionOfAccount(a))
+	return base
+}
+
+// billingBase 返回账号所属 region 的计费基址。
+func (c *Client) billingBase(a *authstore.Account) string {
+	_, base, _ := regionBases(regionOfAccount(a))
+	return base
+}
+
+// commonHeaders 设置所有 API 共享的请求头（按 region 设置 Origin/Referer）。
+func commonHeaders(req *http.Request, region Region) {
+	_, _, origin := regionBases(region)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/")
+	req.Header.Set("User-Agent", clientUA)
+}
+
+// billingHeaders billing / growth 域请求头。
+func billingHeaders(req *http.Request, a *authstore.Account) {
+	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	if a.UID != "" {
+		req.Header.Set("X-User-Id", a.UID)
+	}
+	if a.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
+	}
+	if a.Domain != "" {
+		req.Header.Set("X-Domain", a.Domain)
 	}
 }
 
-// chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
-func (c *Client) chatHTTP() *http.Client {
-	if c.ChatHTTP != nil {
-		return c.ChatHTTP
-	}
-	return c.HTTP
-}
-
-// defaultGlobalBase 缺省 global base（D5：config 未覆盖时默认 workbuddy.ai）。
-const defaultGlobalBase = "https://www.workbuddy.ai"
-
-// globalChatBase 生效的 global chat base：Client.ChatBaseGlobal 非空取之，否则默认。
-func (c *Client) globalChatBase() string {
-	if c.ChatBaseGlobal != "" {
-		return c.ChatBaseGlobal
-	}
-	return defaultGlobalBase
-}
-
-// globalBillingBase 生效的 global billing base：Client.BillingBaseGlobal 非空取之，否则默认。
-func (c *Client) globalBillingBase() string {
-	if c.BillingBaseGlobal != "" {
-		return c.BillingBaseGlobal
-	}
-	return defaultGlobalBase
-}
-
-// globalOn 报告账号是否路由到 global 上游：GlobalEnabled 开且账号 Realm()==global。
-// 双保险：config 开关是第一道闸（上游侧），auth.Realm() 的开关闸是第二道（账号侧）。
-func (c *Client) globalOn(a *auth.Auth) bool {
-	return c.GlobalEnabled && a != nil && a.Realm() == "global"
-}
-
-func (c *Client) chatBase(a *auth.Auth) string {
-	if c.globalOn(a) {
-		return c.globalChatBase()
-	}
-	return c.ChatBaseCN
-}
-
-// prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-// 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
-func (c *Client) prepareBody(body []byte, realm string) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(realm))
-}
-
-// effortsSnapshot 返回指定 realm 的 effort 能力缓存副本；该域无探测 → nil（透传不降级）。
-func (c *Client) effortsSnapshot(realm string) map[string][]string {
-	c.effortsMu.RLock()
-	defer c.effortsMu.RUnlock()
-	bucket, ok := c.efforts[realmKey(realm)]
-	if !ok || len(bucket) == 0 {
-		return nil
-	}
-	cp := make(map[string][]string, len(bucket))
-	for k, v := range bucket {
-		cp[k] = v
-	}
-	return cp
-}
-
-// realmKey 归一化 efforts 缓存键：cn/global。空 realm 视为 cn（老调用/无前缀模型名）。
-func realmKey(realm string) string {
-	if realm == "" {
-		return "cn"
-	}
-	return realm
-}
-
-func (c *Client) billingBase(a *auth.Auth) string {
-	if c.globalOn(a) {
-		return c.globalBillingBase()
-	}
-	return c.BillingBaseCN
-}
-
-// billing 域端点路径（billingBase + path）。balance/checkin 与 report（report.go）同域，
-// 统一走 billingJSON 发请求。
-const (
-	billingMeterPath  = "/billing/meter/get-user-resource"  // global 首选（R9：国际版无 /v2 前缀）
-	dailyCheckinPath  = "/billing/meter/daily-checkin"      // global 首选
-	billingMeterPathV2 = "/v2/billing/meter/get-user-resource" // CN 现状 / global fallback
-	dailyCheckinPathV2 = "/v2/billing/meter/daily-checkin"
-)
-
-// billingMeterPaths 按 realm 返回 billing/meter 域路径候选序列：
-// global → [无 /v2, 有 /v2]（404 时 fallback）；cn → [有 /v2]（现状逐字，零回归）。
-// 仅作用于 get-user-resource / daily-checkin（/billing/meter/* 族）；report /v2/report 不参与，
-// 其他 billing 端点（growth 等）路径不含 /billing/meter 前缀，走原常量不受影响。
-func (c *Client) billingMeterPaths(a *auth.Auth) []string {
-	if c.globalOn(a) {
-		return []string{billingMeterPath, billingMeterPathV2}
-	}
-	return []string{billingMeterPathV2}
-}
-
-// checkinMeterPaths 同上，针对 daily-checkin。
-func (c *Client) checkinMeterPaths(a *auth.Auth) []string {
-	if c.globalOn(a) {
-		return []string{dailyCheckinPath, dailyCheckinPathV2}
-	}
-	return []string{dailyCheckinPathV2}
-}
-
-// doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
+// doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带分类的 *Error。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("网络请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		kind := Classify(resp.StatusCode, string(raw))
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+		return nil, &Error{
+			Kind:   Classify(resp.StatusCode, string(raw)),
+			Status: resp.StatusCode,
+			Msg:    describeBody(resp.StatusCode, raw),
+		}
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("parse failed: %w (body: %s)", err, truncate(string(raw), 120))
+		return nil, fmt.Errorf("响应解析失败: %w (body: %s)", err, truncate(string(raw), 120))
 	}
 	if env.Code != 0 {
 		kind := Classify(resp.StatusCode, env.Msg)
 		if kind == ErrNone {
 			kind = ErrClient
 		}
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
+		return nil, &Error{
+			Kind:   kind,
+			Status: resp.StatusCode,
+			Msg:    fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160)),
+		}
 	}
 	return env.Data, nil
 }
 
-// RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
-// 调用方负责 SaveAtomic。全程持 a 锁，防止并发 SaveAtomic 读半更新 token。
-func (c *Client) RefreshToken(a *auth.Auth) error {
-	a.Lock()
-	defer a.Unlock()
-	if strings.TrimSpace(a.RefreshToken) == "" {
-		return fmt.Errorf("no refreshToken")
+// describeBody 把上游错误响应体转成可读文案（不含状态码——状态码由 Error.Error() 统一带出）。
+//
+// 上游在网关层（openresty/apisix）拒绝请求时返回的是 HTML 错误页，而不是 JSON 信封。
+// 直接把 HTML 塞进错误信息会让用户看到一大坨标签却看不出问题；这里识别 HTML 后
+// 换成人话，并保留可操作的处置建议（401 通常意味着 token 失效）。
+func describeBody(status int, raw []byte) string {
+	body := strings.TrimSpace(string(raw))
+	looksHTML := strings.HasPrefix(body, "<") || strings.Contains(strings.ToLower(body), "<html")
+	if looksHTML {
+		switch status {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return "上游拒绝授权（token 可能已失效，请刷新或重新登录）"
+		case http.StatusNotFound:
+			return "上游接口不存在（域名或路径可能已变更）"
+		default:
+			return "上游返回了非 JSON 的错误页"
+		}
 	}
-	url := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
-	req, err := http.NewRequest(http.MethodPost, url, nil)
+	if body == "" {
+		return "上游返回空响应"
+	}
+	return truncate(body, 200)
+}
+
+// ---------------------------------------------------------------------------
+// OAuth 设备授权登录
+// ---------------------------------------------------------------------------
+
+// StartLogin 申请设备授权，返回 state 与用户需在浏览器打开的授权 URL。
+func (c *Client) StartLogin(region Region) (state, authURL string, err error) {
+	base, _, _ := regionBases(region)
+	req, err := http.NewRequest(http.MethodPost, base+EndpointAuthState, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return "", "", err
+	}
+	commonHeaders(req, region)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return "", "", err
+	}
+	var st struct {
+		State   string `json:"state"`
+		AuthURL string `json:"authUrl"`
+	}
+	if err := json.Unmarshal(data, &st); err != nil {
+		return "", "", fmt.Errorf("授权响应解析失败: %w", err)
+	}
+	if st.State == "" {
+		return "", "", fmt.Errorf("授权响应缺少 state")
+	}
+	// 上游偶发缺 authUrl（尤其 global），此时用 base 兜底拼一个登录页。
+	url := st.AuthURL
+	if url == "" {
+		url = base + "/login?state=" + st.State + "&platform=CLI"
+	}
+	parsed, parseErr := neturl.Parse(url)
+	if parseErr != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil {
+		return "", "", fmt.Errorf("授权响应包含不安全的登录地址")
+	}
+	return st.State, url, nil
+}
+
+// PollLogin 轮询一次登录结果。
+//
+// 返回 (nil, nil) 表示用户尚未完成登录（预期状态，前端继续轮询）；
+// 返回非 nil Account 表示登录成功（accessToken/uid 已填充，但尚未落盘）。
+func (c *Client) PollLogin(region Region, state string) (*authstore.Account, error) {
+	if strings.TrimSpace(state) == "" {
+		return nil, fmt.Errorf("缺少 state")
+	}
+	base, _, _ := regionBases(region)
+
+	req, err := http.NewRequest(http.MethodGet, base+EndpointAuthToken+state, nil)
+	if err != nil {
+		return nil, err
+	}
+	commonHeaders(req, region)
+	data, err := c.doJSON(req)
+	if err != nil {
+		var ue *Error
+		// 服务端「登录未完成」以业务 code != 0 表达；5xx/网络错误才是真失败。
+		if errors.As(err, &ue) && ue.Status > 0 && ue.Status < 500 {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var tok struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresIn    int64  `json:"expiresIn"`
+		Domain       string `json:"domain"`
+	}
+	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
+		// 拿不到 token 视为尚未完成，让前端继续轮询。
+		return nil, nil
+	}
+	// global 上游可能不返回 domain，按 region 兜底写入，保证 regionOfAccount 判得准。
+	if tok.Domain == "" {
+		if region == RegionGlobal {
+			tok.Domain = "www.workbuddy.ai"
+		} else {
+			tok.Domain = "copilot.tencent.com"
+		}
+	}
+	acct := &authstore.Account{
+		AccessToken:  tok.AccessToken,
+		RefreshToken: tok.RefreshToken,
+		Domain:       tok.Domain,
+	}
+	if tok.ExpiresIn > 0 {
+		acct.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+	}
+	// login/account 拿 uid / nickname / enterpriseId（带 Bearer；失败不视为登录失败）。
+	acctReq, err := http.NewRequest(http.MethodGet, base+EndpointLoginAccount+state, nil)
+	if err == nil {
+		commonHeaders(acctReq, region)
+		acctReq.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+		if resp, err := c.HTTP.Do(acctReq); err == nil {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			var env apiEnvelope
+			if json.Unmarshal(raw, &env) == nil && env.Code == 0 {
+				var info struct {
+					UID          string `json:"uid"`
+					EnterpriseID string `json:"enterpriseId"`
+					Nickname     string `json:"nickname"`
+				}
+				if json.Unmarshal(env.Data, &info) == nil {
+					acct.UID = info.UID
+					acct.EnterpriseID = info.EnterpriseID
+					acct.Nickname = info.Nickname
+				}
+			}
+		}
+	}
+	if acct.UID == "" {
+		return nil, fmt.Errorf("登录成功但未能获取 uid，请稍后重试或改用 login.sh")
+	}
+	return acct, nil
+}
+
+// ---------------------------------------------------------------------------
+// Token / 签到 / 余额
+// ---------------------------------------------------------------------------
+
+// RefreshToken 刷新 access token，就地更新 a（不落盘，调用方负责 Save）。
+func (c *Client) RefreshToken(a *authstore.Account) error {
+	if strings.TrimSpace(a.RefreshToken) == "" {
+		return fmt.Errorf("账号缺少 refreshToken，无法刷新（需重新登录）")
+	}
+	region := regionOfAccount(a)
+	req, err := http.NewRequest(http.MethodPost, c.chatBase(a)+"/v2/plugin/auth/token/refresh", nil)
 	if err != nil {
 		return err
 	}
-	c.RefreshHeaders(req, a)
+	commonHeaders(req, region)
+	req.Header.Set("X-Refresh-Token", a.RefreshToken)
+	if a.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+	}
+	req.Header.Set("X-Auth-Refresh-Source", "workbuddy")
+
 	data, err := c.doJSON(req)
 	if err != nil {
 		return err
@@ -569,7 +512,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		Domain       string `json:"domain"`
 	}
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
-		return fmt.Errorf("refresh_failed: no accessToken in response — re-login required")
+		return fmt.Errorf("刷新失败：响应无 accessToken，需重新登录")
 	}
 	a.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
@@ -578,391 +521,387 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if tok.Domain != "" {
 		a.Domain = tok.Domain
 	}
-	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
+	// 响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
 	if tok.ExpiresIn > 0 {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
 	return nil
 }
 
-// chatPath 按 realm 返回 chat 端点路径（不含 base）：
-// global → /console/chat/completions（404/405 时由 ChatStream fallback /v2/chat/completions）；
-// cn → /v2/chat/completions（现状逐字，零回归）。
-func (c *Client) chatPath(a *auth.Auth) string {
-	if c.globalOn(a) {
-		return globalChatConsolePath
-	}
-	return chatCompletionsPath
+// CheckinResult 签到结果。
+type CheckinResult struct {
+	Already bool
+	Message string
+	Raw     string
 }
 
-// 路径常量：CN 现状路径（chatCompletionsPath）与 global 双候选路径。
-const (
-	chatCompletionsPath   = "/v2/chat/completions"
-	globalChatConsolePath = "/console/chat/completions"
-)
-
-// chatFallbackHTTPStatus global chat fallback 只在 404/405 时发生（R9：上游新旧路径分叉）。
-func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
-
-// ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
-// clientIP 为本次请求的客户端 IP（PassthroughIP=true 时注入；空串表示不透传）。
-// 按**请求传递**而非读共享字段：避免并发请求交叉污染对方 IP（issue：ClientIP 竞态）。
-// meta 为会话头族（issue #35）：同一次 user send 的换号/重试/降级复用同一
-// conversationRequestID，后台按它聚合（handler 轮转循环外生成，循环内原样传）。
-// 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
-// 只有传输层失败才返回 err。
-//
-// global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
-// （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
-func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	var cancel context.CancelFunc
-	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
-	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
-	prepared := c.prepareBody(body, a.Realm())
-	if c.globalOn(a) {
-		prepared = ensureConsoleSystem(prepared)
+// DailyCheckin 执行每日签到。已签到不视为失败，返回 Already=true。
+func (c *Client) DailyCheckin(a *authstore.Account) (*CheckinResult, error) {
+	req, err := http.NewRequest(http.MethodPost, c.billingBase(a)+"/v2/billing/meter/daily-checkin", bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return nil, err
 	}
-	for attempt, path := range c.chatPaths(a) {
-		url := c.chatBase(a) + path
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
-		if err != nil {
-			return nil, 0, nil, err
+	billingHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		if IsAlreadyCheckedIn(err) {
+			return &CheckinResult{Already: true, Message: err.Error()}, nil
 		}
-		c.ChatHeaders(req, a, clientIP, meta)
-		ctx, cancel := context.WithCancel(context.Background())
-		req = req.WithContext(ctx)
-		resp, err := c.chatHTTP().Do(req)
-		if err != nil {
-			cancel()
-			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
-			return nil, 0, nil, err
-		}
-		if resp.StatusCode >= 400 {
-			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			resp.Body.Close()
-			cancel()
-			kind := Classify(resp.StatusCode, string(raw))
-			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
-				logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
-			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
-			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
-				continue
+		return nil, err
+	}
+	raw := strings.TrimSpace(string(data))
+	msg := "签到成功"
+	if raw != "" && raw != "null" {
+		msg = "签到成功：" + truncate(raw, 160)
+	}
+	return &CheckinResult{Message: msg, Raw: raw}, nil
+}
+
+// resourcePackage 单个套餐的容量字段。
+type resourcePackage struct {
+	PackageCode         string `json:"PackageCode"`
+	PackageName         string `json:"PackageName"`
+	CapacityRemain      int64  `json:"CapacityRemain"`
+	CapacityUsed        int64  `json:"CapacityUsed"`
+	CapacitySize        int64  `json:"CapacitySize"`
+	CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
+	CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+	CycleCapacitySize   int64  `json:"CycleCapacitySize"`
+}
+
+// Credits 账号积分概览。
+type Credits struct {
+	Remain       int64    `json:"remain"`
+	Used         int64    `json:"used"`
+	Size         int64    `json:"size"`
+	Packages     int      `json:"packages"`
+	PackageCodes []string `json:"-"`
+}
+
+// DailyPackage is an upstream daily package slice. It is quota information,
+// not a fabricated transaction ledger.
+type DailyPackage struct {
+	Code      string  `json:"code"`
+	Name      string  `json:"name"`
+	Total     float64 `json:"total"`
+	Used      float64 `json:"used"`
+	Remaining float64 `json:"remaining"`
+}
+
+// DailyFreePackages reads the official daily free-package slices. The panel
+// labels these as quota allocation/consumption and never claims they are a
+// monetary or credit transaction history.
+func (c *Client) DailyFreePackages(a *authstore.Account, packageCodes []string) ([]DailyPackage, error) {
+	if len(packageCodes) == 0 {
+		return nil, fmt.Errorf("上游未返回可查询的套餐编号")
+	}
+	now := time.Now()
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	end := start.Add(24*time.Hour - time.Millisecond)
+	body := map[string]any{
+		"PageNumber": 1, "PageSize": 200, "Status": []int{0, 3},
+		"PackageCodes":         packageCodes,
+		"SlicePeriodStartTime": start.Format("2006-01-02 15:04:05"),
+		"SlicePeriodEndTime":   end.Format("2006-01-02 15:04:05"),
+	}
+	base := c.billingBase(a)
+	domain := strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(strings.TrimSpace(a.Domain)), "https://"), "http://")
+	if domain == "workbuddy.cn" || domain == "www.workbuddy.cn" {
+		base = "https://www.workbuddy.cn"
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, base+"/billing/meter/get-user-resource-free-packages", bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	billingHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil, fmt.Errorf("每日套餐响应解析失败: %w", err)
+	}
+	rows := findPackageRows(decoded)
+	out := make([]DailyPackage, 0, len(rows))
+	for _, row := range rows {
+		values := row
+		if details, ok := row["SlicePeriodUsageDetails"].([]any); ok && len(details) > 0 {
+			if first, ok := details[0].(map[string]any); ok {
+				values = first
 			}
-			return nil, resp.StatusCode, raw, nil
 		}
-		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
-		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
-		// ctx 无 deadline 无 goroutine，连接由 resp.Body.Close 正常清理。
-		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
-	}
-	cancel()
-	return nil, 0, nil, nil
-}
-
-// chatPaths 返回按 realm 的 chat 路径候选序列：
-// global → [console, /v2]（向 Fallback 迭代）；cn → [/v2]（单元素，现状）。
-func (c *Client) chatPaths(a *auth.Auth) []string {
-	if c.globalOn(a) {
-		return []string{globalChatConsolePath, chatCompletionsPath}
-	}
-	return []string{chatCompletionsPath}
-}
-
-// ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
-type ModelInfo struct {
-	ID            string
-	Name          string
-	ContextWindow int64    // = maxInputTokens
-	MaxTokens     int64    // = maxOutputTokens
-	Efforts       []string // reasoning.supportedEfforts（空=未知/固定档）
-}
-
-// 模型目录端点路径常量（按 realm 切）：
-// CN 现状 /console/enterprises/personal/models 逐字保留（零回归）；
-// global 走 /v2/enterprises/personal/models（PR #20 实测 /console 500、/v2 200 含
-// credits 倍率的完整模型表）。modelsPath 按 globalOn 分发。
-const (
-	cnModelsPath     = "/console/enterprises/personal/models"
-	globalModelsPath = "/v2/enterprises/personal/models"
-)
-
-// modelsPath 按 realm 返回动态模型目录端点路径（不含 base）。
-// CN → /console/enterprises/personal/models（现状，零回归）；
-// global → /v2/enterprises/personal/models（国际版实测可用路径，见 global_models.go
-// probe 家族）：governed by globalOn（config global.enabled + 账号 realm 双闸）。
-func (c *Client) modelsPath(a *auth.Auth) string {
-	if c.globalOn(a) {
-		return globalModelsPath
-	}
-	return cnModelsPath
-}
-
-// FetchModels 调上游动态模型接口。
-// 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
-func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
-	url := c.chatBase(a) + c.modelsPath(a)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
-	}
-	var env struct {
-		Code int `json:"code"`
-		Data struct {
-			Models []struct {
-				ID              string `json:"id"`
-				Name            string `json:"name"`
-				MaxInputTokens  int64  `json:"maxInputTokens"`
-				MaxOutputTokens int64  `json:"maxOutputTokens"`
-				Disabled        bool   `json:"disabled"`
-				Reasoning       struct {
-					Effort           string   `json:"effort"`
-					SupportedEfforts []string `json:"supportedEfforts"`
-				} `json:"reasoning"`
-			} `json:"models"`
-			Agents []struct {
-				Name   string   `json:"name"`
-				Models []string `json:"models"`
-			} `json:"agents"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("models parse: %w", err)
-	}
-	if env.Code != 0 {
-		return nil, fmt.Errorf("models api code=%d", env.Code)
-	}
-	var cliIDs []string
-	for _, ag := range env.Data.Agents {
-		if ag.Name == "cli" {
-			cliIDs = ag.Models
-			break
+		// Some accounts return a nested SlicePeriodUsageDetails array while
+		// others return the same daily values as CycleCapacity* on the row.
+		total := firstFloat(values, "SlicePeriodCapacitySizePrecise", "SlicePeriodCapacitySize", "CycleCapacitySizePrecise", "CycleCapacitySize")
+		remain := firstFloat(values, "SlicePeriodCapacityRemainPrecise", "SlicePeriodCapacityRemain", "CycleCapacityRemainPrecise", "CycleCapacityRemain")
+		used := firstFloat(values, "SlicePeriodCapacityUsedPrecise", "SlicePeriodCapacityUsed", "CycleCapacityUsedPrecise", "CycleCapacityUsed")
+		if total == 0 {
+			total = remain + used
 		}
-	}
-	if len(cliIDs) == 0 {
-		return nil, fmt.Errorf("no cli agent models found")
-	}
-	dynMap := make(map[string]struct {
-		ID              string
-		Name            string
-		MaxInputTokens  int64
-		MaxOutputTokens int64
-		Disabled        bool
-		Efforts         []string
-	}, len(env.Data.Models))
-	for _, m := range env.Data.Models {
-		dynMap[m.ID] = struct {
-			ID              string
-			Name            string
-			MaxInputTokens  int64
-			MaxOutputTokens int64
-			Disabled        bool
-			Efforts         []string
-		}{m.ID, m.Name, m.MaxInputTokens, m.MaxOutputTokens, m.Disabled, m.Reasoning.SupportedEfforts}
-	}
-	out := make([]ModelInfo, 0, len(cliIDs))
-	for _, id := range cliIDs {
-		m, ok := dynMap[id]
-		if !ok || m.Disabled {
-			continue
+		if used == 0 && total > remain {
+			used = total - remain
 		}
-		out = append(out, ModelInfo{
-			ID:            m.ID,
-			Name:          m.Name,
-			ContextWindow: m.MaxInputTokens,
-			MaxTokens:     m.MaxOutputTokens,
-			Efforts:       m.Efforts,
-		})
+		out = append(out, DailyPackage{Code: firstText(row, "PackageCode", "packageCode"), Name: firstText(row, "PackageName", "packageName"), Total: total, Used: used, Remaining: remain})
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("models api returned empty list")
-	}
-	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
-	cache := make(map[string][]string, len(out))
-	for _, mi := range out {
-		if len(mi.Efforts) > 0 {
-			cache[mi.ID] = mi.Efforts
-		}
-	}
-	if len(cache) == 0 {
-		return out, nil
-	}
-	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
-	c.effortsMu.Lock()
-	if c.efforts == nil {
-		c.efforts = make(map[string]map[string][]string)
-	}
-	c.efforts[realmKey(a.Realm())] = cache
-	c.effortsMu.Unlock()
 	return out, nil
 }
 
-// billingMeterJSON 按 realm 候选路径发 billing/meter 域请求，ErrNotFound 时换下一候选路径
-// （global：/billing/meter/* → /v2/billing/meter/*；cn：单路径 /v2/billing/meter/* 现状）。
-func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
-	var lastErr error
-	for i, p := range paths {
-		data, err := c.billingJSON(a, method, p, body)
-		if err != nil {
-			lastErr = err
-			var ue *Error
-			if i < len(paths)-1 && errors.As(err, &ue) && ue.Kind == ErrNotFound {
-				continue // /billing/meter/* 404 → 换 /v2/billing/meter/*
+func asFloat(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case json.Number:
+		f, _ := n.Float64()
+		return f
+	case string:
+		f, _ := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		return f
+	}
+	return 0
+}
+func firstFloat(row map[string]any, keys ...string) float64 {
+	for _, k := range keys {
+		if v, ok := row[k]; ok {
+			if n := asFloat(v); n != 0 {
+				return n
 			}
-			return nil, err
 		}
-		return data, nil
 	}
-	return nil, lastErr
+	return 0
+}
+func firstText(row map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := row[k]; ok {
+			if s := strings.TrimSpace(fmt.Sprint(v)); s != "" && s != "<nil>" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+func findPackageRows(v any) []map[string]any {
+	switch x := v.(type) {
+	case map[string]any:
+		for _, k := range []string{"Accounts", "accounts", "Packages", "packages"} {
+			if raw, ok := x[k].([]any); ok {
+				out := make([]map[string]any, 0, len(raw))
+				for _, item := range raw {
+					if row, ok := item.(map[string]any); ok {
+						out = append(out, row)
+					}
+				}
+				return out
+			}
+		}
+		for _, child := range x {
+			if rows := findPackageRows(child); rows != nil {
+				return rows
+			}
+		}
+	}
+	return nil
 }
 
-// UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
-func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
+// GrowthTask is deliberately loose because the reverse-engineered response is
+// not a stable public schema. Raw tokens and headers are never returned.
+type GrowthTask struct {
+	Code         string         `json:"code"`
+	Name         string         `json:"name"`
+	Status       string         `json:"status"`
+	AcceptStatus string         `json:"accept_status"`
+	Progress     float64        `json:"progress"`
+	Target       float64        `json:"target"`
+	Reward       float64        `json:"reward"`
+	Raw          map[string]any `json:"raw,omitempty"`
+}
+
+func (c *Client) GrowthTasks(a *authstore.Account) ([]GrowthTask, error) {
+	data, err := c.growthJSON(a, http.MethodGet, "/v2/activity/growth/tasks", nil)
+	if err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil, err
+	}
+	rows := findObjectRows(decoded)
+	out := make([]GrowthTask, 0, len(rows))
+	for _, row := range rows {
+		code := firstText(row, "task_code", "taskCode", "code", "id")
+		name := firstText(row, "task_name", "taskName", "name", "title")
+		if code == "" && name == "" {
+			continue
+		}
+		progress, _ := row["progress"].(map[string]any)
+		acceptStatus := firstText(row, "accept_status", "acceptStatus")
+		status := firstText(row, "status", "state", "task_status")
+		if status == "" {
+			status = acceptStatus
+		}
+		out = append(out, GrowthTask{Code: code, Name: name, Status: status, AcceptStatus: acceptStatus, Progress: firstFloat(progress, "current"), Target: firstFloat(progress, "target"), Reward: firstFloat(row, "reward", "reward_credit", "rewardCredit"), Raw: row})
+	}
+	return out, nil
+}
+
+// ConsoleTasks reads the reverse-engineered task list in read-only mode.
+// Writes are intentionally excluded until their request contracts are verified.
+func (c *Client) ConsoleTasks(a *authstore.Account) ([]map[string]any, error) {
+	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/console/as/tasks", nil)
+	if err != nil {
+		return nil, err
+	}
+	billingHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil, err
+	}
+	return findObjectRows(decoded), nil
+}
+
+var schedulerTaskID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,160}$`)
+
+// ConsoleTaskDetail reads the documented detail endpoint for one account
+// scheduler task. IDs are constrained before becoming part of the URL path.
+func (c *Client) ConsoleTaskDetail(a *authstore.Account, taskID string) (map[string]any, error) {
+	if !schedulerTaskID.MatchString(taskID) {
+		return nil, fmt.Errorf("任务标识不合法")
+	}
+	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/console/as/tasks/"+taskID, nil)
+	if err != nil {
+		return nil, err
+	}
+	billingHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil, err
+	}
+	if row, ok := decoded.(map[string]any); ok {
+		return row, nil
+	}
+	return nil, fmt.Errorf("上游任务详情格式异常")
+}
+
+func (c *Client) AvailableModels(a *authstore.Account) ([]map[string]any, error) {
+	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v2/enterprises/personal/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	billingHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil, err
+	}
+	return findObjectRows(decoded), nil
+}
+
+func findObjectRows(v any) []map[string]any {
+	switch x := v.(type) {
+	case []any:
+		out := make([]map[string]any, 0, len(x))
+		for _, item := range x {
+			if row, ok := item.(map[string]any); ok {
+				out = append(out, row)
+			}
+		}
+		return out
+	case map[string]any:
+		for _, k := range []string{"tasks", "items", "list", "data", "records", "rows", "models"} {
+			if child, ok := x[k]; ok {
+				if rows := findObjectRows(child); rows != nil {
+					return rows
+				}
+			}
+		}
+		for _, child := range x {
+			if rows := findObjectRows(child); rows != nil {
+				return rows
+			}
+		}
+	}
+	return nil
+}
+
+// UserResource 查询账号可花费积分余额（所有套餐聚合，负值钳 0）。
+func (c *Client) UserResource(a *authstore.Account) (*Credits, error) {
 	now := time.Now()
-	body := map[string]any{
+	body, _ := json.Marshal(map[string]any{
 		"PageNumber":               1,
 		"PageSize":                 100,
 		"ProductCode":              "p_tcaca",
 		"Status":                   []int{0, 3},
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
-	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+	})
+	req, err := http.NewRequest(http.MethodPost, c.billingBase(a)+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return nil, err
+	}
+	billingHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
 	}
 	var resp struct {
 		Response struct {
 			Data struct {
-				Accounts []struct {
-					PackageName         string `json:"PackageName"`
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-				} `json:"Accounts"`
+				TotalDosage int64             `json:"TotalDosage"`
+				Accounts    []resourcePackage `json:"Accounts"`
 			} `json:"Data"`
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, fmt.Errorf("resource parse: %w", err)
+		return nil, fmt.Errorf("积分响应解析失败: %w", err)
 	}
-	for _, acct := range resp.Response.Data.Accounts {
-		var r int64
-		switch {
-		case acct.CycleCapacitySize > 0:
-			r = acct.CycleCapacityRemain
-		case acct.CycleCapacityRemain > 0 || acct.CycleCapacityUsed > 0:
-			r = acct.CycleCapacityRemain
-		default:
-			r = acct.CapacityRemain
+	out := &Credits{Packages: len(resp.Response.Data.Accounts)}
+	for _, p := range resp.Response.Data.Accounts {
+		if p.PackageCode != "" {
+			out.PackageCodes = append(out.PackageCodes, p.PackageCode)
 		}
-		if r < 0 {
-			r = 0
-		}
-		remain += r
+		remain, used, size := packageRemainUsed(p)
+		out.Remain += remain
+		out.Used += used
+		out.Size += size
 	}
-	return remain, nil
+	if out.Size > 0 {
+		if derived := out.Size - out.Remain; derived > out.Used {
+			out.Used = derived
+		}
+	}
+	if dosage := resp.Response.Data.TotalDosage; dosage > out.Size {
+		out.Size = dosage
+		if derived := out.Size - out.Remain; derived > out.Used {
+			out.Used = derived
+		}
+	}
+	if out.Remain < 0 {
+		out.Remain = 0
+	}
+	return out, nil
 }
 
-// ResourceSummary 查询账号积分套餐的完整聚合口径（remain=剩余可花积分、used=已用、
-// size=总量、packs=套餐数），供运维工具（cmd/credit）按 realm 展示真实余额。
-// 与 UserResource 的差异：UserResource 只取 remain；本方法额外聚合 used/size/packs，
-// 且 TotalDosage 作 size 下限（与 cmd/credit 历史口径一致，见其 packageRemainUsed）。
-//
-// realm 感知继承 billingMeterPaths：global 账号打 workbuddy.ai /billing/meter/*（404
-// fallback /v2），CN 账号维持 /v2/billing/meter/get-user-resource（现状逐字，零回归）。
-func (c *Client) ResourceSummary(a *auth.Auth) (remain, used, size int64, packs int, err error) {
-	now := time.Now()
-	body := map[string]any{
-		"PageNumber":               1,
-		"PageSize":                 100,
-		"ProductCode":              "p_tcaca",
-		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
-	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-	var resp struct {
-		Response struct {
-			Data struct {
-				TotalDosage int64 `json:"TotalDosage"`
-				Accounts    []struct {
-					PackageName         string `json:"PackageName"`
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-				} `json:"Accounts"`
-			} `json:"Data"`
-		} `json:"Response"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("resource parse: %w", err)
-	}
-	for _, acct := range resp.Response.Data.Accounts {
-		r, u, s := packageRemainUsed(respAccount{
-			CapacityRemain:      acct.CapacityRemain,
-			CapacityUsed:        acct.CapacityUsed,
-			CapacitySize:        acct.CapacitySize,
-			CycleCapacityRemain: acct.CycleCapacityRemain,
-			CycleCapacityUsed:   acct.CycleCapacityUsed,
-			CycleCapacitySize:   acct.CycleCapacitySize,
-		})
-		remain += r
-		used += u
-		size += s
-	}
-	packs = len(resp.Response.Data.Accounts)
-	// TotalDosage 作 size 下限（历史口径：已消耗的不该比总剂量小）。
-	if size > 0 {
-		if derived := size - remain; derived > used {
-			used = derived
-		}
-	}
-	if dosage := resp.Response.Data.TotalDosage; dosage > size {
-		size = dosage
-		if derived := size - remain; derived > used {
-			used = derived
-		}
-	}
-	return remain, used, size, packs, nil
-}
-
-// respAccount 供 packageRemainUsed 解析的套餐字段（与 cmd/credit resourcePackage 同构）。
-type respAccount struct {
-	CapacityRemain      int64
-	CapacityUsed        int64
-	CapacitySize        int64
-	CycleCapacityRemain int64
-	CycleCapacityUsed   int64
-	CycleCapacitySize   int64
-}
-
-// packageRemainUsed 聚合单套餐的 remain/used/size（历史口径见 cmd/credit/billing.go，
-// 迁移至此作为单一事实来源）。Cycle 期套餐优先：用 CycleCapacity 三字段，
-// used 取 CycleUsed 与 size-remain 的较大者；否则回退 Capacity 三字段。
-func packageRemainUsed(a respAccount) (remain, used, size int64) {
-	if a.CycleCapacitySize > 0 {
-		remain = a.CycleCapacityRemain
-		size = a.CycleCapacitySize
+// packageRemainUsed 按 Cycle* 优先的口径拆出 remain/used/size
+// （与 workbuddy2api/cmd/credit 及网关 UserResource 的聚合口径保持一致）。
+func packageRemainUsed(p resourcePackage) (remain, used, size int64) {
+	if p.CycleCapacitySize > 0 {
+		remain = p.CycleCapacityRemain
+		size = p.CycleCapacitySize
 		if remain < 0 {
 			remain = 0
 		}
@@ -970,47 +909,226 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 			remain = size
 		}
 		used = size - remain
-		if a.CycleCapacityUsed > used {
-			used = a.CycleCapacityUsed
+		if p.CycleCapacityUsed > used {
+			used = p.CycleCapacityUsed
 			if size >= used {
 				remain = size - used
 			}
 		}
 		return remain, used, size
 	}
-	remain = a.CapacityRemain
-	used = a.CapacityUsed
-	size = a.CapacitySize
+	remain = p.CapacityRemain
+	used = p.CapacityUsed
+	size = p.CapacitySize
 	if used == 0 && size > remain {
 		used = size - remain
 	}
 	return remain, used, size
 }
 
-// DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
-func (c *Client) DailyCheckin(a *auth.Auth) error {
-	_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
+// ---------------------------------------------------------------------------
+// 猫猫旅行
+// ---------------------------------------------------------------------------
+
+// Buddy 账号当前猫档案；nil 表示无猫。
+type Buddy struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+}
+
+// TravelState 猫猫旅行状态。
+type TravelState struct {
+	State             string `json:"state"`               // idle / traveling / arrived
+	DailyLimitReached bool   `json:"daily_limit_reached"` // 今日已派出过（CST 自然日重置）
+	RecordID          int64  `json:"record_id"`
+	RewardCredit      int64  `json:"reward_credit"`
+}
+
+// growthJSON 发 growth 域请求并解信封。
+func (c *Client) growthJSON(a *authstore.Account, method, path string, body any) (json.RawMessage, error) {
+	var rdr io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		rdr = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, c.chatBase(a)+path, rdr)
+	if err != nil {
+		return nil, err
+	}
+	billingHeaders(req, a)
+	return c.doJSON(req)
+}
+
+// TravelStatus 查询猫猫旅行状态。
+func (c *Client) TravelStatus(a *authstore.Account) (*TravelState, error) {
+	data, err := c.growthJSON(a, http.MethodGet, TravelStatusPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	var st TravelState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, fmt.Errorf("旅行状态解析失败: %w", err)
+	}
+	return &st, nil
+}
+
+// TravelDepart 派出猫旅行。
+func (c *Client) TravelDepart(a *authstore.Account, locationID int) error {
+	_, err := c.growthJSON(a, http.MethodPost, TravelDepartPath, map[string]any{"location_id": locationID})
 	return err
 }
 
-// IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
-// 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等成功，
-// 否则停机补签遇到抖动会误记为 already，账号当天实际未签到却被判定正常。
-func IsAlreadyCheckin(err error) bool {
-	var ue *Error
-	if !errors.As(err, &ue) {
-		return false
+// TravelClaim 领取到站奖励，返回 reward_credit。
+func (c *Client) TravelClaim(a *authstore.Account, recordID int64) (int64, error) {
+	data, err := c.growthJSON(a, http.MethodPost, TravelClaimPath, map[string]any{"record_id": recordID})
+	if err != nil {
+		return 0, err
 	}
-	for _, m := range alreadyCheckinMarkers {
-		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
-			return true
+	var resp struct {
+		RewardCredit int64 `json:"reward_credit"`
+	}
+	if len(data) > 0 {
+		_ = json.Unmarshal(data, &resp)
+	}
+	return resp.RewardCredit, nil
+}
+
+// BuddyInfo 查询当前猫档案；返回 (nil, nil) 表示无猫。
+func (c *Client) BuddyInfo(a *authstore.Account) (*Buddy, error) {
+	data, err := c.growthJSON(a, http.MethodGet, BuddyInfoPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Buddy json.RawMessage `json:"buddy"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(string(resp.Buddy))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+	var b Buddy
+	if err := json.Unmarshal(resp.Buddy, &b); err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+// BuddyFirst 领养第一只猫（门槛未达标返回 HTTP 400，属预期）。
+func (c *Client) BuddyFirst(a *authstore.Account) error {
+	_, err := c.growthJSON(a, http.MethodPost, BuddyFirstPath, map[string]any{})
+	return err
+}
+
+// BuddyAgreement 同意协议（幂等）。
+func (c *Client) BuddyAgreement(a *authstore.Account) error {
+	_, err := c.growthJSON(a, http.MethodPost, BuddyAgreementPath, map[string]any{"agree": true})
+	return err
+}
+
+// TravelResult 单账号一次旅行巡检结果。
+type TravelResult struct {
+	UID     string `json:"uid"`
+	Action  string `json:"action"` // adopt / depart / claim / skip / error
+	Message string `json:"message"`
+	Reward  int64  `json:"reward,omitempty"`
+	Buddy   string `json:"buddy,omitempty"`
+}
+
+// TravelOnce 对单个账号推进一趟旅行状态机（单趟只做一个动作，不轮询不等待）。
+//
+// 状态机与 workbuddy2api/internal/scheduler/travel.go 对齐：
+//
+//	无猫            → 同意协议 + 尝试领养（门槛未达标属预期，静默跳过）
+//	state=idle      → 今日未派出则派出（location_id=4）
+//	state=arrived   → 领取到站奖励
+//	state=traveling / 今日已达上限 → 跳过
+func (c *Client) TravelOnce(a *authstore.Account) (*TravelResult, error) {
+	res := &TravelResult{UID: a.UID}
+	buddy, err := c.BuddyInfo(a)
+	if err != nil {
+		res.Action = "error"
+		res.Message = "查询猫档案失败: " + err.Error()
+		return res, err
+	}
+	if buddy == nil {
+		// 先同意协议（幂等），再尝试领养。
+		if err := c.BuddyAgreement(a); err != nil {
+			res.Action = "error"
+			res.Message = "同意协议失败: " + err.Error()
+			return res, err
 		}
+		if err := c.BuddyFirst(a); err != nil {
+			if IsBuddyTaskIncomplete(err) {
+				res.Action = "skip"
+				res.Message = "领养门槛未达标（今日不再重试）"
+				return res, nil
+			}
+			res.Action = "error"
+			res.Message = "领养失败: " + err.Error()
+			return res, err
+		}
+		res.Action = "adopt"
+		res.Message = "领养成功（+300 积分）"
+		return res, nil
 	}
-	return false
+	res.Buddy = buddy.Name
+
+	st, err := c.TravelStatus(a)
+	if err != nil {
+		res.Action = "error"
+		res.Message = "查询旅行状态失败: " + err.Error()
+		return res, err
+	}
+	switch st.State {
+	case "idle":
+		if st.DailyLimitReached {
+			res.Action = "skip"
+			res.Message = "今日已派出，等待归来"
+			return res, nil
+		}
+		if err := c.TravelDepart(a, TravelLocationID); err != nil {
+			if IsBuddyTaskIncomplete(err) {
+				res.Action = "skip"
+				res.Message = "派出条件未满足，今日跳过"
+				return res, nil
+			}
+			res.Action = "error"
+			res.Message = "派出失败: " + err.Error()
+			return res, err
+		}
+		res.Action = "depart"
+		res.Message = "已派猫出门（古镇客栈）"
+		return res, nil
+	case "arrived":
+		reward, err := c.TravelClaim(a, st.RecordID)
+		if err != nil {
+			res.Action = "error"
+			res.Message = "领奖失败: " + err.Error()
+			return res, err
+		}
+		res.Action = "claim"
+		res.Reward = reward
+		res.Message = fmt.Sprintf("已领取到站奖励 +%d", reward)
+		return res, nil
+	case "traveling":
+		res.Action = "skip"
+		res.Message = "猫正在旅行中"
+		return res, nil
+	default:
+		res.Action = "skip"
+		res.Message = fmt.Sprintf("未知状态 %q，跳过", st.State)
+		return res, nil
+	}
 }
 
 func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
 	if len(s) > n {
 		return s[:n]
 	}

@@ -1,16 +1,20 @@
 services:
-  wb2api:
+  workbuddy-control-center:
     build: .
-    container_name: workbuddy2api
-    restart: unless-stopped
-    environment:
-      - TZ=Asia/Shanghai
+    container_name: workbuddy-control-center
     ports:
-      - "7863:7863"
+      - "127.0.0.1:8787:8787"
+    environment:
+      WBCC_LISTEN: "0.0.0.0:8787"
+      WBCC_AUTH_DIR: "/auths"
+      WBCC_DATA_DIR: "/data"
+      WBCC_USERNAME: "admin"
+      WBCC_TASK_RUNNER: "/gateway-scripts/task_runner.py"
     volumes:
-      - ./auths:/app/auths
-      # data 保持 bind mount（本地映射，与旧版本一致）。
-      # 若容器内 app(uid 10001) 写 state.json 报 permission denied，宿主机执行：
-      #   chown -R 10001:10001 ./data
-      - ./data:/app/data
-      - ./config.json:/app/config.json:ro
+      - ./control-center.json:/app/control-center.json:ro
+      # 唯一与网关共享的内容：WorkBuddy OAuth 凭据。
+      - ../workbuddy2api/auths:/auths
+      # 复用上游已吸收并验证过的成长任务 runner；只读挂载，不改网关代码。
+      - ../workbuddy2api/scripts:/gateway-scripts:ro
+      - ./data:/data
+    restart: unless-stopped

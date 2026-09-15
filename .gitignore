@@ -1,36 +1,31 @@
-# Auth & secrets
-auths/
-data/
-*.key
-*.pem
-*.env
-.env
-.env.*
+# 运行时数据与本地构建产物
+wbgui
+/config.json
+/testenv/
+/shots/
+/.chrome-profile/
 
-# Binaries (anchored to repo root only — bare "login"/"credit" would also ignore cmd/login/, cmd/credit/)
-/login
-/credit
-/wb2api
-/signin_bin
+# 运行时数据目录：含账号凭证、配置备份、面板登录凭据（绝不能入库）
+/data/
+/control-center.json
 
-# Config with secrets (use config.example.json)
-config.json
+# 前端依赖与构建产物（构建产物由 Dockerfile 生成，不入库）
+web/node_modules/
+web/dist/
+internal/webui/dist/assets/
 
-# Build artifacts
-*.tmp
-__pycache__/
-
-# Backups (contains auth tokens)
-backups/
-
-# IDE
+# 编辑器 / 系统
+.DS_Store
+*.swp
 .idea/
 .vscode/
-LOOP.md
-PLAN.md
-SPEC.md
-docs/
 
-# 设计/计划文档（但 README.md 必须进版本库）
-*.md
-!README.md
+# 本地代理工作目录与工具链
+.workbuddy-ai/
+.playwright-cli/
+
+# 测试临时产物
+.chrome-profile/
+shot.sh
+web/tsconfig.tsbuildinfo
+shots/
